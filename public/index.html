@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Slop Review</title>
+    <link rel="stylesheet" href="/vendor/pico.min.css">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="board-zone" aria-label="Chess board">
+        <div class="player-bar top">
+          <div class="player-card-mini black">
+            <div class="avatar">♟</div>
+            <div>
+              <strong id="blackName">Black</strong>
+              <span id="blackScore">Precision -</span>
+            </div>
+          </div>
+          <div class="clock">10:00</div>
+        </div>
+
+        <div class="board-row">
+          <div class="eval-bar" aria-label="Evaluation bar">
+            <div id="evalBarFill"></div>
+            <span id="evalPill" class="eval-pill">0.00</span>
+          </div>
+          <div class="board-stack">
+            <div id="board" class="board" aria-label="Chess board"></div>
+            <div class="board-topline">
+              <div>
+                <span id="positionLabel" class="eyebrow">Start</span>
+                <strong id="turnLabel">White to move</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="player-bar bottom">
+          <div class="player-card-mini white">
+            <div class="avatar">♙</div>
+            <div>
+              <strong id="whiteName">White</strong>
+              <span id="whiteScore">Precision -</span>
+            </div>
+          </div>
+          <div class="clock active">10:00</div>
+        </div>
+      </section>
+
+      <section class="inspector" aria-label="Slop Review">
+        <div class="panel-title">
+          <button id="newGameBtn" class="icon-button" title="Load PGN" aria-label="Load PGN"><i data-lucide="arrow-left"></i></button>
+          <strong><span class="title-icon">★</span> Slop Review</strong>
+          <button id="flipBoardBtn" class="icon-button" title="Flip board" aria-label="Flip board"><i data-lucide="search"></i></button>
+        </div>
+
+        <div id="statusText" class="status" role="status">Ready</div>
+        <details class="engine-settings">
+          <summary>Engine settings</summary>
+          <div class="engine-strip">
+            <label>
+              <span>Time</span>
+              <input id="timeMs" type="number" min="20" max="10000" step="10" value="120">
+            </label>
+            <label>
+              <span>Lines</span>
+              <input id="multiPv" type="number" min="1" max="5" step="1" value="3">
+            </label>
+            <label>
+              <span>Threads</span>
+              <input id="threads" type="number" min="1" max="16" step="1" value="1">
+            </label>
+            <label>
+              <span>Hash</span>
+              <input id="hashMb" type="number" min="16" max="4096" step="16" value="128">
+            </label>
+          </div>
+        </details>
+        <div id="tabContent" class="tab-content"></div>
+
+        <div class="coach-actions">
+          <button id="bestMoveBtn" class="command secondary" title="Show best move">
+            <i data-lucide="badge-star"></i>
+            <span>Best</span>
+          </button>
+          <button id="explainBtn" class="command secondary" title="Explain this move">
+            <i data-lucide="lightbulb"></i>
+            <span>Explain</span>
+          </button>
+          <button id="runReviewBtn" class="primary command review-button" title="Run game review">
+            <i data-lucide="sparkles"></i>
+            <span>Start Review</span>
+          </button>
+        </div>
+
+        <div class="move-list-shell">
+          <div class="move-list-title">
+            <span>Moves</span>
+            <span id="moveCount">0 plies</span>
+          </div>
+          <div id="moveList" class="move-list"></div>
+        </div>
+
+        <div class="panel-bottom">
+          <canvas id="evalGraph" class="eval-graph" height="86" aria-label="Evaluation graph"></canvas>
+          <div class="transport">
+            <button id="goStartBtn" class="icon-button" title="Start" aria-label="Start"><i data-lucide="skip-back"></i></button>
+            <button id="prevMoveBtn" class="icon-button" title="Previous move" aria-label="Previous move"><i data-lucide="chevron-left"></i></button>
+            <button id="nextMoveBtn" class="icon-button" title="Next move" aria-label="Next move"><i data-lucide="chevron-right"></i></button>
+            <button id="goEndBtn" class="icon-button" title="End" aria-label="End"><i data-lucide="skip-forward"></i></button>
+          </div>
+          <div id="scoreCards" class="score-cards"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/vendor/lucide.min.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
