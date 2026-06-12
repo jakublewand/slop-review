@@ -243,6 +243,25 @@ select {
   will-change: transform;
 }
 
+.piece-drag-ghost {
+  position: fixed;
+  z-index: 100;
+  width: min(10.5vw, 10.5vh);
+  max-width: 96px;
+  min-width: 48px;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  filter: drop-shadow(0 8px 10px rgba(0, 0, 0, 0.38));
+}
+
+.board.dragging-piece {
+  cursor: grabbing;
+}
+
+.square.drag-source .piece-img {
+  opacity: 0.25;
+}
+
 @keyframes piece-slide {
   from {
     transform: translate(var(--move-x), var(--move-y));

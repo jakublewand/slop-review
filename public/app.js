@@ -33,6 +33,9 @@ const state = {
   animation: null,
   drawings: {},
   pendingDraw: null,
+  drag: null,
+  suppressNextBoardClick: false,
+  audioContext: null,
   isReviewing: false,
   annotations: JSON.parse(localStorage.getItem('local-review-annotations') || '{}'),
 };
@@ -75,7 +78,9 @@ function bindEvents() {
   board.addEventListener('click', onBoardClick);
   board.addEventListener('contextmenu', (event) => event.preventDefault());
   board.addEventListener('pointerdown', onBoardPointerDown);
+  board.addEventListener('pointermove', onBoardPointerMove);
   board.addEventListener('pointerup', onBoardPointerUp);
+  board.addEventListener('pointercancel', cancelPieceDrag);
   $('#evalGraph').addEventListener('click', onGraphClick);
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('resize', drawGraph);
@@ -379,7 +384,7 @@ function renderBoard() {
     }
     board.append(button);
   }
-  board.append(boardOverlay(lastMove, drawings));
+  board.append(boardOverlay(drawings));
   armAnimationClear();
 
   const position = currentPosition();
@@ -397,10 +402,13 @@ function renderEval(chess) {
   const variationMove = state.variation?.currentIndex > 0
     ? state.variation.moves[state.variation.currentIndex - 1]
     : null;
+  const liveVariationEval = state.variation && state.evalResult?.fen === activeFen()
+    ? state.evalResult.lines?.[0]?.whiteCp
+    : null;
   const cp = state.retry
     ? null
     : state.variation
-      ? variationMove?.whiteCp ?? state.variation.line?.whiteCp ?? null
+      ? liveVariationEval ?? variationMove?.whiteCp ?? state.variation.line?.whiteCp ?? null
       : point?.eval ?? 0;
   const display = cp === null ? 'live' : formatEval(cp);
   $('#evalPill').textContent = display;
@@ -448,23 +456,13 @@ function activeDisplayMove() {
   return state.currentPly > 0 ? state.review?.moves[state.currentPly - 1] || null : null;
 }
 
-function boardOverlay(move, drawings) {
+function boardOverlay(drawings) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('class', 'board-overlay');
   svg.setAttribute('viewBox', '0 0 100 100');
   svg.setAttribute('aria-hidden', 'true');
 
   const arrows = [...drawings.arrows];
-  if (move?.from && move?.to) {
-    const info = state.review?.classificationInfo?.[move.classification];
-    arrows.unshift({
-      from: move.from,
-      to: move.to,
-      color: info?.color || '#75b843',
-      className: 'move-arrow',
-    });
-  }
-
   arrows.forEach((arrow, index) => {
     const start = squareCenter(arrow.from);
     const end = squareCenter(arrow.to);
@@ -554,8 +552,13 @@ function legalMovesFrom(chess, square) {
 
 function onBoardClick(event) {
   if (event.button !== 0) return;
+  if (state.suppressNextBoardClick) {
+    state.suppressNextBoardClick = false;
+    return;
+  }
   const square = event.target.closest('.square')?.dataset.square;
   if (!square) return;
+  const clearedArrows = clearCurrentArrows();
   if (state.retry) {
     handleRetryClick(square);
     return;
@@ -569,7 +572,11 @@ function onBoardClick(event) {
   const chess = new Chess();
   chess.load(currentPosition().fen);
   const piece = chess.get(square);
-  if (piece?.color !== chess.turn()) return;
+  if (!piece && clearedArrows) renderBoard();
+  if (piece?.color !== chess.turn()) {
+    if (clearedArrows) renderBoard();
+    return;
+  }
   ensureVariation(true, {
     source: 'manual',
     title: 'Explore line',
@@ -600,23 +607,10 @@ function handleRetryClick(square) {
     return;
   }
 
-  const move = chooseLegalMove(chess, selected, square);
-  if (!move) {
+  if (!playRetryMove(selected, square)) {
     state.retry.selected = piece?.color === chess.turn() ? square : null;
     render();
-    return;
   }
-
-  const uci = `${move.from}${move.to}${move.promotion || ''}`;
-  if (uci === state.retry.targetUci) {
-    state.retry.fen = chess.fen();
-    state.retry.done = true;
-    state.retry.message = `${move.san} is the engine move.`;
-  } else {
-    state.retry.message = `${move.san} is legal, but Stockfish prefers ${state.retry.targetSan || state.retry.targetUci}.`;
-  }
-  state.retry.selected = null;
-  render();
 }
 
 function handleVariationClick(square) {
@@ -637,24 +631,10 @@ function handleVariationClick(square) {
     return;
   }
 
-  const beforeFen = chess.fen();
-  const move = chooseLegalMove(chess, selected, square);
-  if (!move) {
+  if (!playVariationMove(selected, square)) {
     state.variation.selected = piece?.color === chess.turn() ? square : null;
     render();
-    return;
   }
-
-  const moveObject = variationMoveFromPlayed(move, beforeFen, chess.fen());
-  const keptMoves = state.variation.moves.slice(0, state.variation.currentIndex);
-  state.variation.moves = [...keptMoves, moveObject];
-  state.variation.currentIndex = state.variation.moves.length;
-  state.variation.fen = moveObject.afterFen;
-  state.variation.selected = null;
-  state.evalResult = null;
-  state.animation = animationForMove(moveObject.from, moveObject.to, moveObject.to, 'variation');
-  render();
-  evaluateVariationPosition();
 }
 
 function chooseLegalMove(chess, from, to) {
@@ -664,15 +644,90 @@ function chooseLegalMove(chess, from, to) {
   return chess.move({ from, to, promotion: picked.promotion });
 }
 
+function playRetryMove(from, to) {
+  const chess = new Chess();
+  chess.load(state.retry.fen);
+  const move = chooseLegalMove(chess, from, to);
+  if (!move) return false;
+
+  const uci = `${move.from}${move.to}${move.promotion || ''}`;
+  if (uci === state.retry.targetUci) {
+    state.retry.fen = chess.fen();
+    state.retry.done = true;
+    state.retry.message = `${move.san} is the engine move.`;
+    state.animation = animationForMove(move.from, move.to, move.to, 'retry');
+    playMoveSound();
+  } else {
+    state.retry.message = `${move.san} is legal, but Stockfish prefers ${state.retry.targetSan || state.retry.targetUci}.`;
+  }
+  state.retry.selected = null;
+  render();
+  return true;
+}
+
+function playVariationMove(from, to) {
+  const chess = new Chess();
+  chess.load(variationFen());
+  const beforeFen = chess.fen();
+  const move = chooseLegalMove(chess, from, to);
+  if (!move) return false;
+
+  const moveObject = variationMoveFromPlayed(move, beforeFen, chess.fen());
+  const keptMoves = state.variation.moves.slice(0, state.variation.currentIndex);
+  state.variation.moves = [...keptMoves, moveObject];
+  state.variation.currentIndex = state.variation.moves.length;
+  state.variation.fen = moveObject.afterFen;
+  state.variation.selected = null;
+  state.evalResult = null;
+  state.animation = animationForMove(moveObject.from, moveObject.to, moveObject.to, 'variation');
+  playMoveSound();
+  render();
+  evaluateVariationPosition();
+  return true;
+}
+
+function playBoardMove(from, to) {
+  if (state.retry) return playRetryMove(from, to);
+  if (!state.review || state.showSetup) return false;
+  if (!state.variation) {
+    ensureVariation(true, {
+      source: 'manual',
+      title: 'Explore line',
+      basePly: state.currentPly,
+      baseFen: currentPosition().fen,
+    });
+  }
+  return playVariationMove(from, to);
+}
+
 function onBoardPointerDown(event) {
-  if (event.button !== 2) return;
   const square = event.target.closest('.square')?.dataset.square;
   if (!square) return;
-  event.preventDefault();
-  state.pendingDraw = { square };
+  if (event.button === 2) {
+    event.preventDefault();
+    state.pendingDraw = { square };
+    return;
+  }
+  if (event.button !== 0) return;
+  beginPieceDrag(event, square);
+}
+
+function onBoardPointerMove(event) {
+  const drag = state.drag;
+  if (!drag) return;
+  const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+  if (!drag.active && distance > 5) startPieceDrag(event);
+  if (drag.active) {
+    event.preventDefault();
+    moveDragGhost(event);
+  }
 }
 
 function onBoardPointerUp(event) {
+  if (event.button === 0 && state.drag) {
+    finishPieceDrag(event);
+    return;
+  }
   if (event.button !== 2 || !state.pendingDraw) return;
   const square = event.target.closest('.square')?.dataset.square;
   const from = state.pendingDraw.square;
@@ -681,6 +736,92 @@ function onBoardPointerUp(event) {
   event.preventDefault();
   toggleDrawing(from, square);
   renderBoard();
+}
+
+function beginPieceDrag(event, square) {
+  const chess = new Chess();
+  chess.load(activeFen());
+  const piece = chess.get(square);
+  if (!piece || piece.color !== chess.turn()) return;
+
+  state.drag = {
+    from: square,
+    startX: event.clientX,
+    startY: event.clientY,
+    active: false,
+    pieceSrc: `/pieces/${piece.color}${piece.type.toUpperCase()}.svg`,
+    pointerId: event.pointerId,
+    ghost: null,
+  };
+}
+
+function startPieceDrag(event) {
+  const drag = state.drag;
+  if (!drag || drag.active) return;
+  drag.active = true;
+  clearCurrentArrows();
+  const ghost = document.createElement('img');
+  ghost.className = 'piece-drag-ghost';
+  ghost.src = drag.pieceSrc;
+  ghost.alt = '';
+  document.body.append(ghost);
+  drag.ghost = ghost;
+  $('#board')?.classList.add('dragging-piece');
+  document.querySelector(`[data-square="${drag.from}"]`)?.classList.add('drag-source');
+  moveDragGhost(event);
+  try {
+    $('#board')?.setPointerCapture(drag.pointerId);
+  } catch {
+    // Pointer capture can fail in some synthetic browser runs.
+  }
+}
+
+function moveDragGhost(event) {
+  const ghost = state.drag?.ghost;
+  if (!ghost) return;
+  ghost.style.left = `${event.clientX}px`;
+  ghost.style.top = `${event.clientY}px`;
+}
+
+function finishPieceDrag(event) {
+  const drag = state.drag;
+  if (!drag) return;
+  const wasActive = drag.active;
+  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('.square')?.dataset.square;
+  cleanupPieceDrag();
+  if (!wasActive) return;
+
+  event.preventDefault();
+  state.suppressNextBoardClick = true;
+  window.setTimeout(() => {
+    state.suppressNextBoardClick = false;
+  }, 80);
+  if (target && target !== drag.from) {
+    const moved = playBoardMove(drag.from, target);
+    if (!moved) renderBoard();
+  } else {
+    renderBoard();
+  }
+}
+
+function cancelPieceDrag() {
+  if (!state.drag) return;
+  cleanupPieceDrag();
+  renderBoard();
+}
+
+function cleanupPieceDrag() {
+  const drag = state.drag;
+  if (!drag) return;
+  drag.ghost?.remove();
+  $('#board')?.classList.remove('dragging-piece');
+  document.querySelector(`[data-square="${drag.from}"]`)?.classList.remove('drag-source');
+  try {
+    $('#board')?.releasePointerCapture(drag.pointerId);
+  } catch {
+    // Ignore release failures after cancellation.
+  }
+  state.drag = null;
 }
 
 function onKeydown(event) {
@@ -719,6 +860,13 @@ function toggleDrawing(from, to) {
     return;
   }
   drawings.arrows = [...drawings.arrows, { from, to, color: '#f3d650' }];
+}
+
+function clearCurrentArrows() {
+  const drawings = currentDrawings();
+  if (!drawings.arrows.length) return false;
+  currentDrawings(true).arrows = [];
+  return true;
 }
 
 function currentDrawings(create = false) {
@@ -949,7 +1097,9 @@ function variationCoachMessage() {
 }
 
 function activeEngineLines() {
-  if (state.evalResult?.lines?.length) return state.evalResult.lines;
+  if (state.evalResult?.lines?.length && (!state.variation || state.evalResult.fen === activeFen())) {
+    return state.evalResult.lines;
+  }
   const move = currentReviewedMove();
   return move?.alternatives || [];
 }
@@ -1273,6 +1423,7 @@ async function evaluateVariationPosition() {
     });
     if (requestFen === activeFen()) {
       state.evalResult = result;
+      applyVariationEvaluation(result);
       setStatus('Position evaluated');
       render();
     }
@@ -1284,6 +1435,18 @@ async function evaluateVariationPosition() {
 }
 
 const evaluateCurrentPosition = evaluateVariationPosition;
+
+function applyVariationEvaluation(result) {
+  if (!state.variation || state.variation.currentIndex <= 0) return;
+  const score = result.lines?.[0]?.whiteCp;
+  if (!Number.isFinite(Number(score))) return;
+  const activeMove = state.variation.moves[state.variation.currentIndex - 1];
+  if (!activeMove) return;
+  activeMove.whiteCp = score;
+  if (state.variation.source === 'manual') {
+    activeMove.coach = `${activeMove.san} reaches a position Stockfish evaluates at ${formatEval(score)}.`;
+  }
+}
 
 function startLineVariation(line, options = {}) {
   const visibleLines = activeEngineLines();
@@ -1423,6 +1586,7 @@ function setPly(ply) {
   state.variation = null;
   state.evalResult = null;
   state.animation = mainAnimation(previousPly, nextPly);
+  if (state.animation) playMoveSound();
   render();
 }
 
@@ -1433,8 +1597,11 @@ function setVariationIndex(index) {
   state.variation.currentIndex = nextIndex;
   state.variation.fen = variationFen();
   state.variation.selected = null;
+  state.evalResult = null;
   state.animation = variationAnimation(previousIndex, nextIndex);
+  if (state.animation) playMoveSound();
   render();
+  evaluateVariationPosition();
 }
 
 function mainAnimation(previousPly, nextPly) {
@@ -1465,6 +1632,42 @@ function animationForMove(from, to, target, context) {
     target,
     armed: false,
   };
+}
+
+function playMoveSound() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    state.audioContext ||= new AudioContextClass();
+    const ctx = state.audioContext;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    const tap = ctx.createOscillator();
+    const body = ctx.createOscillator();
+
+    tap.type = 'triangle';
+    tap.frequency.setValueAtTime(520, now);
+    tap.frequency.exponentialRampToValueAtTime(240, now + 0.045);
+
+    body.type = 'sine';
+    body.frequency.setValueAtTime(130, now);
+
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.045, now + 0.004);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.075);
+
+    tap.connect(gain);
+    body.connect(gain);
+    gain.connect(ctx.destination);
+    tap.start(now);
+    body.start(now);
+    tap.stop(now + 0.08);
+    body.stop(now + 0.08);
+  } catch {
+    // Audio is best-effort; browsers may block it before a user gesture.
+  }
 }
 
 function maxPly() {
