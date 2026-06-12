@@ -760,14 +760,21 @@ function startPieceDrag(event) {
   if (!drag || drag.active) return;
   drag.active = true;
   clearCurrentArrows();
+  const sourceSquare = document.querySelector(`[data-square="${drag.from}"]`);
+  const sourceRect = sourceSquare?.getBoundingClientRect();
   const ghost = document.createElement('img');
   ghost.className = 'piece-drag-ghost';
   ghost.src = drag.pieceSrc;
   ghost.alt = '';
+  if (sourceRect) {
+    const size = sourceRect.width * 0.84;
+    ghost.style.width = `${size}px`;
+    ghost.style.height = `${size}px`;
+  }
   document.body.append(ghost);
   drag.ghost = ghost;
   $('#board')?.classList.add('dragging-piece');
-  document.querySelector(`[data-square="${drag.from}"]`)?.classList.add('drag-source');
+  sourceSquare?.classList.add('drag-source');
   moveDragGhost(event);
   try {
     $('#board')?.setPointerCapture(drag.pointerId);
@@ -887,7 +894,9 @@ function drawingKey() {
 function variationMoveFromPlayed(move, beforeFen, afterFen) {
   const fullMove = Number(beforeFen.split(/\s+/)[5] || 1);
   const uci = `${move.from}${move.to}${move.promotion || ''}`;
-  const candidate = activeEngineLines().find((line) => line.uci === uci);
+  const rootLines = activeEngineLines();
+  const candidate = rootLines.find((line) => line.uci === uci);
+  const rootBest = rootLines[0] || null;
   const classification = candidate?.classification || 'good';
   const info = state.review.classificationInfo[classification] || state.review.classificationInfo.good;
   return {
@@ -905,6 +914,10 @@ function variationMoveFromPlayed(move, beforeFen, afterFen) {
     beforeFen,
     afterFen,
     whiteCp: candidate?.whiteCp ?? null,
+    rootBestWhiteCp: rootBest?.whiteCp ?? null,
+    rootBestSan: rootBest?.san || rootBest?.uci || '',
+    rootBestLine: rootBest?.sanLine || '',
+    rootLines,
     classification,
     classificationLabel: info.label,
     classificationColor: info.color,
@@ -1037,8 +1050,11 @@ function renderReviewPanel() {
       <div class="review-coach overview-coach">
         <div class="coach-bubble">You played some nice moves in that tough game. Let us look at a good tactical find you had.</div>
       </div>
+      <canvas id="summaryGraph" class="eval-graph summary-graph" height="86" aria-label="Evaluation graph"></canvas>
       ${reviewSummary()}
     `;
+    $('#summaryGraph')?.addEventListener('click', onGraphClick);
+    drawGraph();
     return;
   }
   content.innerHTML = `
@@ -1443,9 +1459,62 @@ function applyVariationEvaluation(result) {
   const activeMove = state.variation.moves[state.variation.currentIndex - 1];
   if (!activeMove) return;
   activeMove.whiteCp = score;
-  if (state.variation.source === 'manual') {
-    activeMove.coach = `${activeMove.san} reaches a position Stockfish evaluates at ${formatEval(score)}.`;
+  const bestWhiteCp = Number.isFinite(Number(activeMove.rootBestWhiteCp))
+    ? Number(activeMove.rootBestWhiteCp)
+    : score;
+  const lossCp = variationLossFor(activeMove.color, bestWhiteCp, score);
+  const classification = classifyExploredMove(lossCp, activeMove.uci, activeMove.rootLines);
+  applyMoveClassification(activeMove, classification);
+  activeMove.lossCp = lossCp;
+  activeMove.coach = exploredMoveCoach(activeMove, score, lossCp);
+}
+
+function variationLossFor(color, bestWhiteCp, actualWhiteCp) {
+  const rawLoss = color === 'w'
+    ? bestWhiteCp - actualWhiteCp
+    : actualWhiteCp - bestWhiteCp;
+  return Math.max(0, Math.min(1000, Math.round(rawLoss)));
+}
+
+function classifyExploredMove(lossCp, uci, rootLines = []) {
+  if (rootLines[0]?.uci === uci && lossCp <= 12) return 'best';
+  if (lossCp <= 12) return 'excellent';
+  if (lossCp <= 40) return 'excellent';
+  if (lossCp <= 90) return 'good';
+  if (lossCp <= 170) return 'inaccuracy';
+  if (lossCp <= 330) return 'mistake';
+  return 'blunder';
+}
+
+function applyMoveClassification(move, classification) {
+  const info = state.review.classificationInfo[classification] || state.review.classificationInfo.good;
+  move.classification = classification;
+  move.classificationLabel = info.label;
+  move.classificationColor = info.color;
+}
+
+function exploredMoveCoach(move, score, lossCp) {
+  const info = state.review.classificationInfo[move.classification] || {};
+  const best = move.rootBestSan ? ` Stockfish preferred ${move.rootBestSan}` : '';
+  const line = move.rootBestLine ? ` (${move.rootBestLine}).` : '.';
+  const evalText = formatEval(score);
+
+  if (move.classification === 'best') {
+    return `${move.san} matches the engine's top choice and leaves the position at ${evalText}.`;
   }
+  if (move.classification === 'excellent') {
+    return `${move.san} is ${articleFor(info.label)} ${info.label?.toLowerCase()} try: ${evalText}, about ${lossCp} centipawns off the top line.${best ? `${best}${line}` : ''}`;
+  }
+  if (move.classification === 'good') {
+    return `${move.san} is playable, but the eval is ${evalText} and it gives up about ${lossCp} centipawns.${best ? `${best}${line}` : ''}`;
+  }
+  if (move.classification === 'inaccuracy') {
+    return `${move.san} drifts from the best continuation. The position is ${evalText}, about ${lossCp} centipawns worse.${best ? `${best}${line}` : ''}`;
+  }
+  if (move.classification === 'mistake') {
+    return `${move.san} changes the position noticeably: ${evalText}, roughly ${lossCp} centipawns worse than the engine choice.${best ? `${best}${line}` : ''}`;
+  }
+  return `${move.san} is a serious problem in this line. Stockfish evaluates it at ${evalText}, about ${lossCp} centipawns worse.${best ? `${best}${line}` : ''}`;
 }
 
 function startLineVariation(line, options = {}) {
@@ -1510,7 +1579,12 @@ function moveButton(move) {
 }
 
 function drawGraph() {
-  const canvas = $('#evalGraph');
+  drawGraphCanvas($('#evalGraph'));
+  drawGraphCanvas($('#summaryGraph'));
+}
+
+function drawGraphCanvas(canvas) {
+  if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -1518,16 +1592,16 @@ function drawGraph() {
   canvas.height = Math.max(1, Math.round(rect.height * dpr));
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, rect.width, rect.height);
-  ctx.fillStyle = '#fbfcfd';
+  ctx.fillStyle = '#242421';
   ctx.fillRect(0, 0, rect.width, rect.height);
 
   const points = state.review?.graph || [{ ply: 0, eval: 0 }];
-  const pad = 18;
+  const pad = 10;
   const width = rect.width - pad * 2;
   const height = rect.height - pad * 2;
   const zeroY = pad + height / 2;
 
-  ctx.strokeStyle = '#d8dee8';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(pad, zeroY);
@@ -1535,7 +1609,7 @@ function drawGraph() {
   ctx.stroke();
 
   if (points.length < 2) {
-    ctx.fillStyle = '#667085';
+    ctx.fillStyle = '#a8a8a2';
     ctx.fillText('Run review', pad, zeroY - 6);
     return;
   }
@@ -1546,8 +1620,25 @@ function drawGraph() {
     return pad + height / 2 - (clamped / 900) * (height / 2);
   };
 
-  ctx.strokeStyle = '#2f6fbb';
-  ctx.lineWidth = 2;
+  ctx.fillStyle = '#f5f5f0';
+  ctx.beginPath();
+  ctx.moveTo(xFor(0), zeroY);
+  points.forEach((point, index) => {
+    ctx.lineTo(xFor(index), yFor(point.eval));
+  });
+  ctx.lineTo(xFor(points.length - 1), zeroY);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad, zeroY);
+  ctx.lineTo(pad + width, zeroY);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#f5f5f0';
+  ctx.lineWidth = 1.5;
   ctx.beginPath();
   points.forEach((point, index) => {
     const x = xFor(index);
@@ -1560,17 +1651,20 @@ function drawGraph() {
   points.forEach((point, index) => {
     const move = state.review.moves[index - 1];
     const color = move ? state.review.classificationInfo[move.classification].color : '#667085';
-    ctx.fillStyle = index === state.currentPly ? '#111827' : color;
+    ctx.fillStyle = index === state.currentPly ? '#f5f5f0' : color;
+    ctx.strokeStyle = index === state.currentPly ? '#1b1b19' : 'rgba(0, 0, 0, 0.18)';
+    ctx.lineWidth = index === state.currentPly ? 2 : 1;
     ctx.beginPath();
-    ctx.arc(xFor(index), yFor(point.eval), index === state.currentPly ? 4.5 : 3, 0, Math.PI * 2);
+    ctx.arc(xFor(index), yFor(point.eval), index === state.currentPly ? 4.5 : 3.2, 0, Math.PI * 2);
     ctx.fill();
+    ctx.stroke();
   });
 }
 
 function onGraphClick(event) {
   if (!state.review) return;
-  const rect = $('#evalGraph').getBoundingClientRect();
-  const pad = 18;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const pad = 10;
   const usable = rect.width - pad * 2;
   const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - pad) / usable));
   setPly(Math.round(ratio * maxPly()));

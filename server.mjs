@@ -953,6 +953,7 @@ async function reviewGame({ pgn, gameIndex = 0, config }) {
           classification,
           lossCp,
           bestLine,
+          lines: before.lines,
           actualWhiteCp,
           bestWhiteCp,
         }),
@@ -1280,16 +1281,19 @@ function buildKeyMoments(moves, lastBookPly) {
   return moments;
 }
 
-function coachText({ move, classification, lossCp, bestLine, actualWhiteCp, bestWhiteCp }) {
+function coachText({ move, classification, lossCp, bestLine, lines = [], actualWhiteCp, bestWhiteCp }) {
   const who = move.color === 'w' ? 'White' : 'Black';
   const best = bestLine?.firstSan ? ` ${bestLine.firstSan}` : '';
   const swing = Math.abs(actualWhiteCp - bestWhiteCp);
+  const gap = Math.round(bestLineGap(lines, move.color));
 
   switch (classification) {
     case 'brilliant':
       return `${who} found a great move with ${move.san}, and it works even though it sacrifices material.`;
     case 'great':
-      return `${move.san} was the only good move. Other choices would worsen the position by about ${Math.round(swing)} centipawns.`;
+      return gap > 0
+        ? `${move.san} was the only good move. The next-best candidate was about ${gap} centipawns worse.`
+        : `${move.san} was the only move the engine trusted in this position.`;
     case 'best':
       return `${move.san} matches the engine's first choice.`;
     case 'excellent':
