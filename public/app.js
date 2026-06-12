@@ -324,7 +324,7 @@ function renderCoachActions() {
   explainButton.hidden = !isCoach;
 
   const move = currentReviewedMove();
-  bestButton.disabled = !isCoach || !move?.best;
+  bestButton.disabled = !isCoach || state.variationEvalPending || (!state.variation && !move?.best);
   explainButton.disabled = !isCoach || !move;
   bestButton.classList.toggle('active', state.coachMode === 'best');
   explainButton.classList.toggle('active', state.coachMode === 'explain');
@@ -894,7 +894,7 @@ function drawingKey() {
 function variationMoveFromPlayed(move, beforeFen, afterFen) {
   const fullMove = Number(beforeFen.split(/\s+/)[5] || 1);
   const uci = `${move.from}${move.to}${move.promotion || ''}`;
-  const rootLines = activeEngineLines();
+  const rootLines = state.evalResult?.fen === beforeFen ? state.evalResult.lines || [] : [];
   const candidate = rootLines.find((line) => line.uci === uci);
   const rootBest = rootLines[0] || null;
   const classification = candidate?.classification || 'good';
@@ -1116,6 +1116,7 @@ function activeEngineLines() {
   if (state.evalResult?.lines?.length && (!state.variation || state.evalResult.fen === activeFen())) {
     return state.evalResult.lines;
   }
+  if (state.variation) return [];
   const move = currentReviewedMove();
   return move?.alternatives || [];
 }
@@ -1137,6 +1138,7 @@ function bindLinePanel() {
         startIndex: line.moves?.length ? 1 : 0,
       });
       render();
+      evaluateVariationPosition();
     });
   });
   $('#tabContent').querySelectorAll('.variation-chip').forEach((button) => {
@@ -1152,7 +1154,12 @@ function bindLinePanel() {
   $('#evaluateBtn')?.addEventListener('click', evaluateVariationPosition);
 }
 
-function showBestMove() {
+async function showBestMove() {
+  if (state.variation) {
+    await showBestForVariationPosition();
+    return;
+  }
+
   const move = currentReviewedMove();
   if (!move?.best) return;
   if (state.coachMode === 'best' && state.variation?.source === 'best') {
@@ -1171,6 +1178,50 @@ function showBestMove() {
     startIndex: move.best.moves?.length ? 1 : 0,
   });
   render();
+  evaluateVariationPosition();
+}
+
+async function showBestForVariationPosition() {
+  const fen = activeFen();
+  let result = state.evalResult?.fen === fen && state.evalResult.lines?.length
+    ? state.evalResult
+    : null;
+
+  if (!result) {
+    state.variationEvalPending = true;
+    renderCoachActions();
+    setStatus('Finding best move...');
+    try {
+      result = await evaluateFen(fen);
+    } catch (error) {
+      setStatus(error.message);
+      return;
+    } finally {
+      state.variationEvalPending = false;
+    }
+    if (fen !== activeFen()) return;
+    state.evalResult = result;
+  }
+
+  const line = result.lines?.[0];
+  if (!line) {
+    setStatus('No best move found for this position');
+    render();
+    return;
+  }
+
+  state.coachMode = 'best';
+  state.retry = null;
+  startLineVariation(line, {
+    source: 'best',
+    title: 'Best line',
+    basePly: state.variation?.basePly ?? state.currentPly,
+    baseFen: fen,
+    startIndex: line.moves?.length ? 1 : 0,
+  });
+  setStatus('Best line loaded');
+  render();
+  evaluateVariationPosition();
 }
 
 function explainCurrentMove() {
@@ -1430,33 +1481,57 @@ function undoVariation() {
 async function evaluateVariationPosition() {
   if (!state.review) return;
   const requestFen = activeFen();
+  const activeMove = state.variation?.currentIndex > 0
+    ? state.variation.moves[state.variation.currentIndex - 1]
+    : null;
   state.variationEvalPending = true;
   setStatus('Evaluating position...');
   try {
-    const result = await postJson('/api/evaluate', {
-      fen: requestFen,
-      config: getEngineConfig(),
-    });
+    if (activeMove?.afterFen === requestFen) {
+      const rootResult = await evaluateFen(activeMove.beforeFen);
+      if (requestFen !== activeFen()) return;
+      applyVariationRootEvaluation(activeMove, rootResult);
+    }
+
+    const result = await evaluateFen(requestFen);
     if (requestFen === activeFen()) {
       state.evalResult = result;
       applyVariationEvaluation(result);
       setStatus('Position evaluated');
-      render();
     }
   } catch (error) {
     setStatus(error.message);
   } finally {
     state.variationEvalPending = false;
+    render();
   }
 }
 
 const evaluateCurrentPosition = evaluateVariationPosition;
 
+async function evaluateFen(fen) {
+  return postJson('/api/evaluate', {
+    fen,
+    config: getEngineConfig(),
+  });
+}
+
+function applyVariationRootEvaluation(move, result) {
+  const lines = result.lines || [];
+  const best = lines[0] || null;
+  const matching = lines.find((line) => line.uci === move.uci);
+  move.rootLines = lines;
+  move.rootBestWhiteCp = best?.whiteCp ?? null;
+  move.rootBestSan = best?.san || best?.uci || '';
+  move.rootBestLine = best?.sanLine || '';
+  move.matchedLineWhiteCp = matching?.whiteCp ?? null;
+}
+
 function applyVariationEvaluation(result) {
   if (!state.variation || state.variation.currentIndex <= 0) return;
-  const score = result.lines?.[0]?.whiteCp;
-  if (!Number.isFinite(Number(score))) return;
   const activeMove = state.variation.moves[state.variation.currentIndex - 1];
+  const score = activeMove?.matchedLineWhiteCp ?? result.lines?.[0]?.whiteCp;
+  if (!Number.isFinite(Number(score))) return;
   if (!activeMove) return;
   activeMove.whiteCp = score;
   const bestWhiteCp = Number.isFinite(Number(activeMove.rootBestWhiteCp))
