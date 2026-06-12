@@ -773,6 +773,116 @@ function uciToMove(uci) {
   };
 }
 
+function engineLinesForClient(fen, lines, mover) {
+  const bestLine = lines[0] || null;
+  const bestWhiteCp = bestLine?.whiteCp ?? 0;
+  return lines.map((line, index) => {
+    const lossCp = index === 0 ? 0 : lineLossCp(line.whiteCp, bestWhiteCp, mover);
+    const classification = index === 0 ? 'best' : classifyLineLoss(lossCp);
+    return engineLineForClient(fen, line, {
+      classification,
+      lossCp,
+      rank: index + 1,
+    });
+  });
+}
+
+function engineLineForClient(fen, line, { classification, lossCp, rank }) {
+  const moves = pvToMoveObjects(fen, line.pv, 8, classification, lossCp);
+  const sanLine = moves.map((move) => move.san).join(' ') || line.sanLine || '';
+  const firstMove = moves[0] || null;
+
+  return {
+    rank,
+    uci: firstMove?.uci || line.pv[0] || '',
+    san: firstMove?.san || line.firstSan || '',
+    sanLine,
+    uciLine: line.pv.slice(0, 8),
+    whiteCp: normalizeEval(line.whiteCp),
+    depth: line.depth,
+    lossCp,
+    classification,
+    classificationLabel: classificationInfo[classification].label,
+    classificationColor: classificationInfo[classification].color,
+    moves,
+    coach: lineCoachText(classification, firstMove?.san || line.firstSan, sanLine, lossCp),
+  };
+}
+
+function pvToMoveObjects(fen, pv, limit = 8, firstClassification = 'best', firstLossCp = 0) {
+  const chess = new Chess();
+  chess.load(fen);
+  const moves = [];
+
+  for (const [index, uci] of pv.slice(0, limit).entries()) {
+    const beforeFen = chess.fen();
+    const fullMove = Number(beforeFen.split(/\s+/)[5] || 1);
+    const played = chess.move(uciToMove(uci));
+    if (!played) break;
+    const classification = index === 0 ? firstClassification : 'best';
+    const info = classificationInfo[classification] || classificationInfo.best;
+    moves.push({
+      index,
+      color: played.color,
+      moveNumber: fullMove,
+      san: played.san,
+      normalizedSan: normalizeSan(played.san),
+      uci: moveToUci(played),
+      from: played.from,
+      to: played.to,
+      promotion: played.promotion || '',
+      flags: played.flags,
+      captured: played.captured || '',
+      beforeFen,
+      afterFen: chess.fen(),
+      classification,
+      classificationLabel: info.label,
+      classificationColor: info.color,
+      coach: index === 0
+        ? lineCoachText(classification, played.san, '', firstLossCp)
+        : `${played.san} follows the engine continuation.`,
+    });
+  }
+
+  return moves;
+}
+
+function lineLossCp(whiteCp, bestWhiteCp, mover) {
+  const rawLoss = mover === 'w'
+    ? bestWhiteCp - whiteCp
+    : whiteCp - bestWhiteCp;
+  return clampNumber(Math.max(0, rawLoss), 0, 1000);
+}
+
+function classifyLineLoss(lossCp) {
+  if (lossCp <= 12) return 'best';
+  if (lossCp <= 40) return 'excellent';
+  if (lossCp <= 90) return 'good';
+  if (lossCp <= 170) return 'inaccuracy';
+  if (lossCp <= 330) return 'mistake';
+  return 'blunder';
+}
+
+function lineCoachText(classification, san, sanLine, lossCp) {
+  const move = san || 'This move';
+  switch (classification) {
+    case 'best':
+      return `${move} is the engine's top choice${sanLine ? `: ${sanLine}` : '.'}`;
+    case 'excellent':
+      return `${move} is a close alternate line and only gives up about ${lossCp} centipawns.`;
+    case 'good':
+      return `${move} is playable, though Stockfish prefers the top line.`;
+    case 'inaccuracy':
+      return `${move} is an alternate line, but it starts to drift from the best continuation.`;
+    case 'mistake':
+      return `${move} allows a noticeably worse position than the best line.`;
+    case 'blunder':
+      return `${move} is not a good alternate line from this position.`;
+    default:
+      return `${move} is one of the engine candidate lines.`;
+  }
+}
+
 async function reviewGame({ pgn, gameIndex = 0, config }) {
   const games = splitPgnGames(pgn);
   if (!games.length) throw new Error('Paste or upload at least one PGN game.');
@@ -823,6 +933,8 @@ async function reviewGame({ pgn, gameIndex = 0, config }) {
         bestWhiteCp,
         actualWhiteCp,
       });
+      const clientLines = engineLinesForClient(move.beforeFen, before.lines, move.color);
+      const bestClientLine = clientLines[0] || null;
 
       const reviewed = {
         ...move,
@@ -834,20 +946,8 @@ async function reviewGame({ pgn, gameIndex = 0, config }) {
         classification,
         classificationLabel: classificationInfo[classification].label,
         classificationColor: classificationInfo[classification].color,
-        best: bestLine ? {
-          uci: bestLine.pv[0] || '',
-          san: bestLine.firstSan,
-          sanLine: bestLine.sanLine,
-          whiteCp: normalizeEval(bestLine.whiteCp),
-          depth: bestLine.depth,
-        } : null,
-        alternatives: before.lines.map((line) => ({
-          uci: line.pv[0] || '',
-          san: line.firstSan,
-          sanLine: line.sanLine,
-          whiteCp: normalizeEval(line.whiteCp),
-          depth: line.depth,
-        })),
+        best: bestClientLine,
+        alternatives: clientLines,
         coach: coachText({
           move,
           classification,
@@ -1240,19 +1340,14 @@ async function evaluatePosition({ fen, config }) {
       timeMs: engineConfig.timeMs,
       multiPv: engineConfig.multiPv,
     });
+    const lines = engineLinesForClient(fen, analysis.lines, analysis.turn);
     return {
       fen,
       engine: {
         path: engine.enginePath,
         config: engineConfig,
       },
-      lines: analysis.lines.map((line) => ({
-        uci: line.pv[0] || '',
-        san: line.firstSan,
-        sanLine: line.sanLine,
-        whiteCp: normalizeEval(line.whiteCp),
-        depth: line.depth,
-      })),
+      lines,
     };
   } finally {
     engine.stop();

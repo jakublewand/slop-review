@@ -29,6 +29,10 @@ const state = {
   retry: null,
   variation: null,
   evalResult: null,
+  variationEvalPending: false,
+  animation: null,
+  drawings: {},
+  pendingDraw: null,
   isReviewing: false,
   annotations: JSON.parse(localStorage.getItem('local-review-annotations') || '{}'),
 };
@@ -59,16 +63,21 @@ function bindEvents() {
     state.variation = null;
     render();
   });
-  $('#goStartBtn').addEventListener('click', () => setPly(0));
-  $('#prevMoveBtn').addEventListener('click', () => setPly(Math.max(0, state.currentPly - 1)));
-  $('#nextMoveBtn').addEventListener('click', () => setPly(Math.min(maxPly(), state.currentPly + 1)));
-  $('#goEndBtn').addEventListener('click', () => setPly(maxPly()));
+  $('#goStartBtn').addEventListener('click', goToStart);
+  $('#prevMoveBtn').addEventListener('click', goToPrevious);
+  $('#nextMoveBtn').addEventListener('click', goToNext);
+  $('#goEndBtn').addEventListener('click', goToEnd);
   $('#flipBoardBtn').addEventListener('click', () => {
     state.orientation = state.orientation === 'white' ? 'black' : 'white';
     renderBoard();
   });
-  $('#board').addEventListener('click', onBoardClick);
+  const board = $('#board');
+  board.addEventListener('click', onBoardClick);
+  board.addEventListener('contextmenu', (event) => event.preventDefault());
+  board.addEventListener('pointerdown', onBoardPointerDown);
+  board.addEventListener('pointerup', onBoardPointerUp);
   $('#evalGraph').addEventListener('click', onGraphClick);
+  window.addEventListener('keydown', onKeydown);
   window.addEventListener('resize', drawGraph);
 }
 
@@ -125,6 +134,8 @@ async function runReview() {
     state.retry = null;
     state.variation = null;
     state.evalResult = null;
+    state.drawings = {};
+    state.animation = null;
     render();
     setStatus('Review complete');
   } catch (error) {
@@ -193,6 +204,7 @@ function render() {
   const hasReview = state.review && !state.showSetup;
   document.body.dataset.reviewed = hasReview ? 'true' : 'false';
   document.body.dataset.reviewPhase = !hasReview ? 'setup' : state.reviewStarted ? 'coach' : 'summary';
+  document.body.dataset.lineMode = state.variation ? 'variation' : 'main';
   renderHeader();
   renderBoard();
   renderTransport();
@@ -220,10 +232,44 @@ function renderHeader() {
 }
 
 function renderTransport() {
-  $('#goStartBtn').disabled = !state.review || state.currentPly === 0;
-  $('#prevMoveBtn').disabled = !state.review || state.currentPly === 0;
-  $('#nextMoveBtn').disabled = !state.review || state.currentPly >= maxPly();
-  $('#goEndBtn').disabled = !state.review || state.currentPly >= maxPly();
+  const current = state.variation ? state.variation.currentIndex : state.currentPly;
+  const max = state.variation ? state.variation.moves.length : maxPly();
+  $('#goStartBtn').disabled = !state.review || current === 0;
+  $('#prevMoveBtn').disabled = !state.review || current === 0;
+  $('#nextMoveBtn').disabled = !state.review || current >= max;
+  $('#goEndBtn').disabled = !state.review || current >= max;
+}
+
+function goToStart() {
+  if (state.variation) {
+    setVariationIndex(0);
+    return;
+  }
+  setPly(0);
+}
+
+function goToPrevious() {
+  if (state.variation) {
+    setVariationIndex(Math.max(0, state.variation.currentIndex - 1));
+    return;
+  }
+  setPly(Math.max(0, state.currentPly - 1));
+}
+
+function goToNext() {
+  if (state.variation) {
+    setVariationIndex(Math.min(state.variation.moves.length, state.variation.currentIndex + 1));
+    return;
+  }
+  setPly(Math.min(maxPly(), state.currentPly + 1));
+}
+
+function goToEnd() {
+  if (state.variation) {
+    setVariationIndex(state.variation.moves.length);
+    return;
+  }
+  setPly(maxPly());
 }
 
 function renderReviewActionButton() {
@@ -283,11 +329,11 @@ function renderBoard() {
   const board = $('#board');
   const chess = new Chess();
   chess.load(activeFen());
-  const lastMove = !state.retry && !state.variation && state.currentPly > 0
-    ? state.review?.moves[state.currentPly - 1]
-    : null;
+  const lastMove = activeDisplayMove();
+  const lastMoveInfo = lastMove ? state.review?.classificationInfo?.[lastMove.classification] : null;
   const selected = activeSelectedSquare();
   const legalTargets = selected ? legalMovesFrom(chess, selected).map((move) => move.to) : [];
+  const drawings = currentDrawings();
 
   board.innerHTML = '';
   for (const square of orientedSquares()) {
@@ -307,6 +353,7 @@ function renderBoard() {
     }
     if (selected === square) button.classList.add('selected');
     if (legalTargets.includes(square)) button.classList.add('legal');
+    if (drawings.squares.includes(square)) button.classList.add('draw-highlight');
     if (lastMove?.from === square) button.classList.add('last-from');
     if (lastMove?.to === square) button.classList.add('last-to');
     if (piece) {
@@ -315,16 +362,31 @@ function renderBoard() {
       img.alt = `${piece.color === 'w' ? 'White' : 'Black'} ${piece.type}`;
       img.draggable = false;
       img.src = `/pieces/${piece.color}${piece.type.toUpperCase()}.svg`;
+      const animation = animationForSquare(square);
+      if (animation) {
+        img.classList.add('piece-animate');
+        img.style.setProperty('--move-x', `${animation.x}%`);
+        img.style.setProperty('--move-y', `${animation.y}%`);
+      }
       button.append(img);
+    }
+    if (lastMove?.to === square && lastMoveInfo) {
+      const marker = document.createElement('span');
+      marker.className = 'move-quality';
+      marker.style.setProperty('--mark-color', lastMoveInfo.color);
+      marker.textContent = lastMoveInfo.mark || lastMove.classificationLabel || '';
+      button.append(marker);
     }
     board.append(button);
   }
+  board.append(boardOverlay(lastMove, drawings));
+  armAnimationClear();
 
   const position = currentPosition();
   $('#positionLabel').textContent = state.retry
     ? 'Retry'
     : state.variation
-      ? 'Variation'
+      ? variationLabel()
       : position.label;
   $('#turnLabel').textContent = `${chess.turn() === 'w' ? 'White' : 'Black'} to move`;
   renderEval(chess);
@@ -332,7 +394,14 @@ function renderBoard() {
 
 function renderEval(chess) {
   const point = state.review?.graph[state.currentPly];
-  const cp = state.retry || state.variation ? null : point?.eval ?? 0;
+  const variationMove = state.variation?.currentIndex > 0
+    ? state.variation.moves[state.variation.currentIndex - 1]
+    : null;
+  const cp = state.retry
+    ? null
+    : state.variation
+      ? variationMove?.whiteCp ?? state.variation.line?.whiteCp ?? null
+      : point?.eval ?? 0;
   const display = cp === null ? 'live' : formatEval(cp);
   $('#evalPill').textContent = display;
   const winShare = cp === null ? 50 : 100 / (1 + Math.exp(-(Math.max(-900, Math.min(900, cp)) / 240)));
@@ -352,8 +421,115 @@ function fileIndex(file) {
 
 function activeFen() {
   if (state.retry) return state.retry.fen;
-  if (state.variation) return state.variation.fen;
+  if (state.variation) return variationFen();
   return currentPosition().fen;
+}
+
+function variationFen(variation = state.variation) {
+  if (!variation) return currentPosition().fen;
+  if (variation.currentIndex <= 0 || !variation.moves.length) return variation.baseFen;
+  return variation.moves[variation.currentIndex - 1]?.afterFen || variation.baseFen;
+}
+
+function variationLabel() {
+  if (!state.variation) return 'Variation';
+  const max = state.variation.moves.length;
+  const current = state.variation.currentIndex;
+  const prefix = state.variation.source === 'best' ? 'Best line' : 'Line';
+  return max ? `${prefix} ${current}/${max}` : prefix;
+}
+
+function activeDisplayMove() {
+  if (state.retry) return null;
+  if (state.variation) {
+    if (state.variation.currentIndex <= 0) return null;
+    return state.variation.moves[state.variation.currentIndex - 1] || null;
+  }
+  return state.currentPly > 0 ? state.review?.moves[state.currentPly - 1] || null : null;
+}
+
+function boardOverlay(move, drawings) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'board-overlay');
+  svg.setAttribute('viewBox', '0 0 100 100');
+  svg.setAttribute('aria-hidden', 'true');
+
+  const arrows = [...drawings.arrows];
+  if (move?.from && move?.to) {
+    const info = state.review?.classificationInfo?.[move.classification];
+    arrows.unshift({
+      from: move.from,
+      to: move.to,
+      color: info?.color || '#75b843',
+      className: 'move-arrow',
+    });
+  }
+
+  arrows.forEach((arrow, index) => {
+    const start = squareCenter(arrow.from);
+    const end = squareCenter(arrow.to);
+    if (!start || !end) return;
+    const markerId = `arrow-head-${index}`;
+    const color = arrow.color || '#f3d650';
+    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+    defs.innerHTML = `
+      <marker id="${markerId}" markerWidth="3.1" markerHeight="3.1" refX="2.65" refY="1.55" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L3.1,1.55 L0,3.1 Z" fill="${escapeHtml(color)}"></path>
+      </marker>
+    `;
+    svg.append(defs);
+
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', start.x);
+    line.setAttribute('y1', start.y);
+    line.setAttribute('x2', end.x);
+    line.setAttribute('y2', end.y);
+    line.setAttribute('stroke', color);
+    line.setAttribute('marker-end', `url(#${markerId})`);
+    line.setAttribute('class', `board-arrow ${arrow.className || ''}`.trim());
+    svg.append(line);
+  });
+
+  return svg;
+}
+
+function squareCenter(square) {
+  const point = squareGridPoint(square);
+  if (!point) return null;
+  return {
+    x: ((point.col + 0.5) / 8) * 100,
+    y: ((point.row + 0.5) / 8) * 100,
+  };
+}
+
+function squareGridPoint(square) {
+  const index = orientedSquares().indexOf(square);
+  if (index < 0) return null;
+  return {
+    col: index % 8,
+    row: Math.floor(index / 8),
+  };
+}
+
+function animationForSquare(square) {
+  const animation = state.animation;
+  if (!animation || animation.target !== square) return null;
+  const start = squareGridPoint(animation.from);
+  const end = squareGridPoint(animation.to);
+  if (!start || !end) return null;
+  return {
+    x: (start.col - end.col) * 100,
+    y: (start.row - end.row) * 100,
+  };
+}
+
+function armAnimationClear() {
+  if (!state.animation || state.animation.armed) return;
+  const id = state.animation.id;
+  state.animation.armed = true;
+  window.setTimeout(() => {
+    if (state.animation?.id === id) state.animation = null;
+  }, 220);
 }
 
 function currentPosition() {
@@ -377,13 +553,30 @@ function legalMovesFrom(chess, square) {
 }
 
 function onBoardClick(event) {
+  if (event.button !== 0) return;
   const square = event.target.closest('.square')?.dataset.square;
   if (!square) return;
   if (state.retry) {
     handleRetryClick(square);
     return;
   }
-  if (state.variation) handleVariationClick(square);
+  if (state.variation) {
+    handleVariationClick(square);
+    return;
+  }
+  if (!state.review || state.showSetup) return;
+
+  const chess = new Chess();
+  chess.load(currentPosition().fen);
+  const piece = chess.get(square);
+  if (piece?.color !== chess.turn()) return;
+  ensureVariation(true, {
+    source: 'manual',
+    title: 'Explore line',
+    basePly: state.currentPly,
+    baseFen: currentPosition().fen,
+  });
+  handleVariationClick(square);
 }
 
 function handleRetryClick(square) {
@@ -428,7 +621,7 @@ function handleRetryClick(square) {
 
 function handleVariationClick(square) {
   const chess = new Chess();
-  chess.load(state.variation.fen);
+  chess.load(variationFen());
   const selected = state.variation.selected;
   const piece = chess.get(square);
 
@@ -444,6 +637,7 @@ function handleVariationClick(square) {
     return;
   }
 
+  const beforeFen = chess.fen();
   const move = chooseLegalMove(chess, selected, square);
   if (!move) {
     state.variation.selected = piece?.color === chess.turn() ? square : null;
@@ -451,11 +645,16 @@ function handleVariationClick(square) {
     return;
   }
 
-  state.variation.fen = chess.fen();
-  state.variation.moves.push(move.san);
+  const moveObject = variationMoveFromPlayed(move, beforeFen, chess.fen());
+  const keptMoves = state.variation.moves.slice(0, state.variation.currentIndex);
+  state.variation.moves = [...keptMoves, moveObject];
+  state.variation.currentIndex = state.variation.moves.length;
+  state.variation.fen = moveObject.afterFen;
   state.variation.selected = null;
   state.evalResult = null;
+  state.animation = animationForMove(moveObject.from, moveObject.to, moveObject.to, 'variation');
   render();
+  evaluateVariationPosition();
 }
 
 function chooseLegalMove(chess, from, to) {
@@ -463,6 +662,106 @@ function chooseLegalMove(chess, from, to) {
   if (!legal.length) return null;
   const picked = legal.find((move) => move.promotion === 'q') || legal[0];
   return chess.move({ from, to, promotion: picked.promotion });
+}
+
+function onBoardPointerDown(event) {
+  if (event.button !== 2) return;
+  const square = event.target.closest('.square')?.dataset.square;
+  if (!square) return;
+  event.preventDefault();
+  state.pendingDraw = { square };
+}
+
+function onBoardPointerUp(event) {
+  if (event.button !== 2 || !state.pendingDraw) return;
+  const square = event.target.closest('.square')?.dataset.square;
+  const from = state.pendingDraw.square;
+  state.pendingDraw = null;
+  if (!square) return;
+  event.preventDefault();
+  toggleDrawing(from, square);
+  renderBoard();
+}
+
+function onKeydown(event) {
+  if (isTypingTarget(event.target)) return;
+  if (event.key === 'Escape') {
+    state.selectedSquare = null;
+    if (state.variation) state.variation.selected = null;
+    if (state.retry) state.retry.selected = null;
+    render();
+  }
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    const key = drawingKey();
+    if (state.drawings[key]) {
+      delete state.drawings[key];
+      renderBoard();
+    }
+  }
+}
+
+function isTypingTarget(target) {
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target?.tagName || '');
+}
+
+function toggleDrawing(from, to) {
+  const drawings = currentDrawings(true);
+  if (from === to) {
+    drawings.squares = drawings.squares.includes(from)
+      ? drawings.squares.filter((square) => square !== from)
+      : [...drawings.squares, from];
+    return;
+  }
+
+  const existing = drawings.arrows.find((arrow) => arrow.from === from && arrow.to === to);
+  if (existing) {
+    drawings.arrows = drawings.arrows.filter((arrow) => arrow !== existing);
+    return;
+  }
+  drawings.arrows = [...drawings.arrows, { from, to, color: '#f3d650' }];
+}
+
+function currentDrawings(create = false) {
+  const key = drawingKey();
+  if (!state.drawings[key] && create) {
+    state.drawings[key] = { squares: [], arrows: [] };
+  }
+  return state.drawings[key] || { squares: [], arrows: [] };
+}
+
+function drawingKey() {
+  if (state.variation) {
+    return `variation-${state.variation.basePly}-${state.variation.source}-${state.variation.currentIndex}`;
+  }
+  return `main-${state.currentPly}`;
+}
+
+function variationMoveFromPlayed(move, beforeFen, afterFen) {
+  const fullMove = Number(beforeFen.split(/\s+/)[5] || 1);
+  const uci = `${move.from}${move.to}${move.promotion || ''}`;
+  const candidate = activeEngineLines().find((line) => line.uci === uci);
+  const classification = candidate?.classification || 'good';
+  const info = state.review.classificationInfo[classification] || state.review.classificationInfo.good;
+  return {
+    index: state.variation.moves.length,
+    color: move.color,
+    moveNumber: fullMove,
+    san: move.san,
+    normalizedSan: normalizeSan(move.san),
+    uci,
+    from: move.from,
+    to: move.to,
+    promotion: move.promotion || '',
+    flags: move.flags,
+    captured: move.captured || '',
+    beforeFen,
+    afterFen,
+    whiteCp: candidate?.whiteCp ?? null,
+    classification,
+    classificationLabel: info.label,
+    classificationColor: info.color,
+    coach: candidate?.coach || `${move.san} starts a manual branch. Compare it with the engine candidates below.`,
+  };
 }
 
 function renderScoreCards() {
@@ -598,7 +897,12 @@ function renderReviewPanel() {
     <div class="review-coach">
       <div class="coach-bubble">${currentCoachMessage()}</div>
     </div>
+    <div class="line-panel">
+      ${lineList(activeEngineLines()) || '<p class="muted">No engine candidates for this move yet.</p>'}
+    </div>
+    ${variationCard()}
   `;
+  bindLinePanel();
 }
 
 function currentReviewedMove() {
@@ -612,6 +916,7 @@ function currentKeyMoment() {
 }
 
 function currentCoachMessage() {
+  if (state.variation) return variationCoachMessage();
   const move = currentReviewedMove();
   const moment = currentKeyMoment();
   if (!move) return escapeHtml('You played some nice moves in that tough game. Let us look at a good tactical find you had.');
@@ -632,11 +937,73 @@ function classificationBadge(key) {
   return `<span class="coach-mark" style="--mark-color:${info.color}">${escapeHtml(info.mark || '')}</span>`;
 }
 
+function variationCoachMessage() {
+  const variation = state.variation;
+  if (!variation) return '';
+  const activeMove = variation.currentIndex > 0 ? variation.moves[variation.currentIndex - 1] : null;
+  if (!activeMove) {
+    const lead = variation.source === 'best' ? 'This is the position before the engine recommendation.' : 'Explore from this position.';
+    return `${classificationBadge(variation.line?.classification || 'best')}${escapeHtml(variation.line?.coach || lead)}`;
+  }
+  return `${classificationBadge(activeMove.classification)}${escapeHtml(activeMove.coach || `${activeMove.san} belongs to this alternate line.`)}`;
+}
+
+function activeEngineLines() {
+  if (state.evalResult?.lines?.length) return state.evalResult.lines;
+  const move = currentReviewedMove();
+  return move?.alternatives || [];
+}
+
+function bindLinePanel() {
+  $('#tabContent').querySelectorAll('.line-item').forEach((button) => {
+    button.addEventListener('click', () => {
+      const line = activeEngineLines()[Number(button.dataset.lineIndex)];
+      if (!line) return;
+      const move = currentReviewedMove();
+      const baseFen = state.evalResult?.fen || move?.beforeFen || currentPosition().fen;
+      const basePly = move ? Math.max(0, move.ply - 1) : state.currentPly;
+      state.coachMode = line.classification === 'best' ? 'best' : 'move';
+      startLineVariation(line, {
+        source: line.classification === 'best' ? 'best' : 'engine',
+        title: `${line.classificationLabel} line`,
+        basePly,
+        baseFen,
+        startIndex: line.moves?.length ? 1 : 0,
+      });
+      render();
+    });
+  });
+  $('#tabContent').querySelectorAll('.variation-chip').forEach((button) => {
+    button.addEventListener('click', () => setVariationIndex(Number(button.dataset.variationIndex)));
+  });
+  $('#undoVariationBtn')?.addEventListener('click', undoVariation);
+  $('#resetVariationBtn')?.addEventListener('click', () => {
+    state.variation = null;
+    state.evalResult = null;
+    state.coachMode = 'move';
+    render();
+  });
+  $('#evaluateBtn')?.addEventListener('click', evaluateVariationPosition);
+}
+
 function showBestMove() {
-  if (!currentReviewedMove()?.best) return;
-  state.coachMode = state.coachMode === 'best' ? 'move' : 'best';
+  const move = currentReviewedMove();
+  if (!move?.best) return;
+  if (state.coachMode === 'best' && state.variation?.source === 'best') {
+    state.coachMode = 'move';
+    state.variation = null;
+    render();
+    return;
+  }
+  state.coachMode = 'best';
   state.retry = null;
-  state.variation = null;
+  startLineVariation(move.best, {
+    source: 'best',
+    title: 'Best line',
+    basePly: Math.max(0, move.ply - 1),
+    baseFen: move.beforeFen,
+    startIndex: move.best.moves?.length ? 1 : 0,
+  });
   render();
 }
 
@@ -644,7 +1011,6 @@ function explainCurrentMove() {
   if (!currentReviewedMove()) return;
   state.coachMode = state.coachMode === 'explain' ? 'move' : 'explain';
   state.retry = null;
-  state.variation = null;
   render();
 }
 
@@ -767,12 +1133,52 @@ function lineList(lines = []) {
   return `
     <div class="line-list">
       ${lines.map((line, index) => `
-        <div class="line-item">
+        <button class="line-item${activeLineIndex() === index ? ' active' : ''}" data-line-index="${index}" title="Show this line">
+          <span class="mark-badge mini" style="--mark-color:${line.classificationColor || '#75b843'}">${escapeHtml(line.classificationLabel ? state.review.classificationInfo[line.classification]?.mark || '' : '')}</span>
           <strong>${index + 1}. ${escapeHtml(line.san || line.uci || '-')} <span class="muted">${formatEval(line.whiteCp)}</span></strong>
           <span>${escapeHtml(line.sanLine || '')}</span>
-        </div>
+        </button>
       `).join('')}
     </div>
+  `;
+}
+
+function activeLineIndex() {
+  if (!state.variation?.line) return -1;
+  return activeEngineLines().findIndex((line) => line.uciLine?.join(' ') === state.variation.line.uciLine?.join(' '));
+}
+
+function variationCard() {
+  if (!state.variation) return '';
+  const moves = state.variation.moves;
+  return `
+    <div class="variation-card">
+      <div class="variation-head">
+        <span>${escapeHtml(state.variation.title || 'Line')}</span>
+        <strong>${state.variation.currentIndex}/${moves.length}</strong>
+      </div>
+      <div class="variation-moves">
+        ${moves.length ? moves.map((move, index) => variationMoveChip(move, index)).join('') : '<span class="muted">Move pieces on the board.</span>'}
+      </div>
+      <div class="inline-actions variation-actions">
+        <button id="evaluateBtn" class="icon-button" title="Evaluate position" aria-label="Evaluate position"><i data-lucide="cpu"></i></button>
+        <button id="undoVariationBtn" class="icon-button" title="Undo line move" aria-label="Undo line move" ${moves.length ? '' : 'disabled'}><i data-lucide="undo-2"></i></button>
+        <button id="resetVariationBtn" class="icon-button" title="Close line" aria-label="Close line"><i data-lucide="x"></i></button>
+      </div>
+    </div>
+  `;
+}
+
+function variationMoveChip(move, index) {
+  const active = state.variation.currentIndex === index + 1 ? ' active' : '';
+  const info = state.review.classificationInfo[move.classification] || state.review.classificationInfo.best;
+  const prefix = move.color === 'w' ? `${move.moveNumber}.` : `${move.moveNumber}...`;
+  return `
+    <button class="variation-chip${active}" data-variation-index="${index + 1}" title="${escapeHtml(move.coach || '')}">
+      <span>${prefix}</span>
+      <span class="mark-badge mini" style="--mark-color:${info.color}">${escapeHtml(info.mark || '')}</span>
+      <strong>${escapeHtml(move.san)}</strong>
+    </button>
   `;
 }
 
@@ -803,7 +1209,7 @@ function renderAnalysisTab() {
     </div>
     <div class="panel-block">
       <h3>Variation line</h3>
-      <p class="muted">${state.variation?.moves?.length ? escapeHtml(state.variation.moves.join(' ')) : 'Start a variation, then play moves on the board.'}</p>
+      <p class="muted">${state.variation?.moves?.length ? escapeHtml(state.variation.moves.map((move) => move.san).join(' ')) : 'Start a variation, then play moves on the board.'}</p>
     </div>
   `;
   $('#evaluateBtn').addEventListener('click', evaluateCurrentPosition);
@@ -825,42 +1231,82 @@ function renderAnalysisTab() {
   });
 }
 
-function ensureVariation(force = false) {
+function ensureVariation(force = false, options = {}) {
   if (state.variation && !force) return;
   state.retry = null;
+  const basePly = Number.isFinite(options.basePly) ? options.basePly : state.currentPly;
+  const baseFen = options.baseFen || currentPosition().fen;
   state.variation = {
-    basePly: state.currentPly,
-    fen: currentPosition().fen,
+    source: options.source || 'manual',
+    title: options.title || 'Explore line',
+    basePly,
+    baseFen,
+    fen: baseFen,
     moves: [],
+    currentIndex: 0,
     selected: null,
+    line: options.line || null,
   };
 }
 
 function undoVariation() {
   if (!state.variation?.moves.length) return;
-  const baseFen = state.review.positions[state.variation.basePly].fen;
-  const chess = new Chess();
-  chess.load(baseFen);
+  const oldIndex = state.variation.currentIndex;
   const moves = state.variation.moves.slice(0, -1);
-  for (const san of moves) chess.move(san);
   state.variation.moves = moves;
-  state.variation.fen = chess.fen();
+  state.variation.currentIndex = Math.min(oldIndex, moves.length);
+  state.variation.fen = variationFen();
   state.evalResult = null;
+  state.animation = null;
   render();
 }
 
-async function evaluateCurrentPosition() {
+async function evaluateVariationPosition() {
+  if (!state.review) return;
+  const requestFen = activeFen();
+  state.variationEvalPending = true;
   setStatus('Evaluating position...');
   try {
-    state.evalResult = await postJson('/api/evaluate', {
-      fen: activeFen(),
+    const result = await postJson('/api/evaluate', {
+      fen: requestFen,
       config: getEngineConfig(),
     });
-    setStatus('Position evaluated');
-    render();
+    if (requestFen === activeFen()) {
+      state.evalResult = result;
+      setStatus('Position evaluated');
+      render();
+    }
   } catch (error) {
     setStatus(error.message);
+  } finally {
+    state.variationEvalPending = false;
   }
+}
+
+const evaluateCurrentPosition = evaluateVariationPosition;
+
+function startLineVariation(line, options = {}) {
+  const visibleLines = activeEngineLines();
+  const moves = (line.moves || []).map((move, index) => ({
+    ...move,
+    index,
+    whiteCp: index === 0 ? line.whiteCp : move.whiteCp ?? line.whiteCp,
+  }));
+  ensureVariation(true, {
+    ...options,
+    line,
+  });
+  state.variation.moves = moves;
+  state.variation.currentIndex = Math.max(0, Math.min(options.startIndex ?? 0, moves.length));
+  state.variation.fen = variationFen();
+  state.variation.line = line;
+  state.variation.selected = null;
+  state.evalResult = {
+    fen: options.baseFen || state.variation.baseFen,
+    lines: visibleLines.length ? visibleLines : [line],
+  };
+  const activeMove = state.variation.currentIndex > 0 ? state.variation.moves[state.variation.currentIndex - 1] : null;
+  state.animation = activeMove ? animationForMove(activeMove.from, activeMove.to, activeMove.to, 'variation') : null;
 }
 
 function renderMoveList() {
@@ -968,13 +1414,57 @@ function onGraphClick(event) {
 }
 
 function setPly(ply) {
-  state.currentPly = Math.max(0, Math.min(maxPly(), ply));
+  const previousPly = state.currentPly;
+  const nextPly = Math.max(0, Math.min(maxPly(), ply));
+  state.currentPly = nextPly;
   state.coachMode = 'move';
   state.selectedSquare = null;
   state.retry = null;
   state.variation = null;
   state.evalResult = null;
+  state.animation = mainAnimation(previousPly, nextPly);
   render();
+}
+
+function setVariationIndex(index) {
+  if (!state.variation) return;
+  const previousIndex = state.variation.currentIndex;
+  const nextIndex = Math.max(0, Math.min(state.variation.moves.length, index));
+  state.variation.currentIndex = nextIndex;
+  state.variation.fen = variationFen();
+  state.variation.selected = null;
+  state.animation = variationAnimation(previousIndex, nextIndex);
+  render();
+}
+
+function mainAnimation(previousPly, nextPly) {
+  if (Math.abs(previousPly - nextPly) !== 1) return null;
+  if (nextPly > previousPly) {
+    const move = state.review?.moves[nextPly - 1];
+    return move ? animationForMove(move.from, move.to, move.to, 'main') : null;
+  }
+  const move = state.review?.moves[previousPly - 1];
+  return move ? animationForMove(move.to, move.from, move.from, 'main') : null;
+}
+
+function variationAnimation(previousIndex, nextIndex) {
+  if (!state.variation || Math.abs(previousIndex - nextIndex) !== 1) return null;
+  if (nextIndex > previousIndex) {
+    const move = state.variation.moves[nextIndex - 1];
+    return move ? animationForMove(move.from, move.to, move.to, 'variation') : null;
+  }
+  const move = state.variation.moves[previousIndex - 1];
+  return move ? animationForMove(move.to, move.from, move.from, 'variation') : null;
+}
+
+function animationForMove(from, to, target, context) {
+  return {
+    id: `${context}-${from}-${to}-${target}-${Date.now()}`,
+    from,
+    to,
+    target,
+    armed: false,
+  };
 }
 
 function maxPly() {
@@ -982,9 +1472,17 @@ function maxPly() {
 }
 
 function formatEval(cp) {
+  if (cp === null || cp === undefined || !Number.isFinite(Number(cp))) return 'live';
   if (Math.abs(cp) >= 90000) return cp > 0 ? 'M+' : 'M-';
   const pawns = cp / 100;
   return `${pawns > 0 ? '+' : ''}${pawns.toFixed(2)}`;
+}
+
+function normalizeSan(san) {
+  return String(san || '')
+    .replace(/[+#?!]+/g, '')
+    .replace(/^0-0-0$/i, 'O-O-O')
+    .replace(/^0-0$/i, 'O-O');
 }
 
 function badge(label, color, mark = '') {
