@@ -1113,12 +1113,26 @@ function variationCoachMessage() {
 }
 
 function activeEngineLines() {
-  if (state.evalResult?.lines?.length && (!state.variation || state.evalResult.fen === activeFen())) {
-    return state.evalResult.lines;
+  if (state.variation) {
+    const move = activeVariationMove();
+    if (move?.rootLines?.length) return move.rootLines;
+    if (!move && state.evalResult?.fen === activeFen() && state.evalResult.lines?.length) {
+      return state.evalResult.lines;
+    }
+    return [];
   }
-  if (state.variation) return [];
+  if (state.evalResult?.lines?.length && state.evalResult.fen === activeFen()) return state.evalResult.lines;
   const move = currentReviewedMove();
   return move?.alternatives || [];
+}
+
+function activeVariationMove() {
+  if (!state.variation || state.variation.currentIndex <= 0) return null;
+  return state.variation.moves[state.variation.currentIndex - 1] || null;
+}
+
+function variationCandidateFen() {
+  return activeVariationMove()?.beforeFen || activeFen();
 }
 
 function bindLinePanel() {
@@ -1127,8 +1141,10 @@ function bindLinePanel() {
       const line = activeEngineLines()[Number(button.dataset.lineIndex)];
       if (!line) return;
       const move = currentReviewedMove();
-      const baseFen = state.evalResult?.fen || move?.beforeFen || currentPosition().fen;
-      const basePly = move ? Math.max(0, move.ply - 1) : state.currentPly;
+      const baseFen = state.variation
+        ? variationCandidateFen()
+        : state.evalResult?.fen || move?.beforeFen || currentPosition().fen;
+      const basePly = state.variation?.basePly ?? (move ? Math.max(0, move.ply - 1) : state.currentPly);
       state.coachMode = line.classification === 'best' ? 'best' : 'move';
       startLineVariation(line, {
         source: line.classification === 'best' ? 'best' : 'engine',
@@ -1182,10 +1198,13 @@ async function showBestMove() {
 }
 
 async function showBestForVariationPosition() {
-  const fen = activeFen();
-  let result = state.evalResult?.fen === fen && state.evalResult.lines?.length
-    ? state.evalResult
-    : null;
+  const moveToReplace = activeVariationMove();
+  const fen = moveToReplace?.beforeFen || activeFen();
+  let result = moveToReplace?.rootLines?.length
+    ? { fen, lines: moveToReplace.rootLines }
+    : state.evalResult?.fen === fen && state.evalResult.lines?.length
+      ? state.evalResult
+      : null;
 
   if (!result) {
     state.variationEvalPending = true;
@@ -1199,8 +1218,9 @@ async function showBestForVariationPosition() {
     } finally {
       state.variationEvalPending = false;
     }
-    if (fen !== activeFen()) return;
-    state.evalResult = result;
+    if (moveToReplace ? activeVariationMove() !== moveToReplace : fen !== activeFen()) return;
+    if (moveToReplace) applyVariationRootEvaluation(moveToReplace, result);
+    else state.evalResult = result;
   }
 
   const line = result.lines?.[0];
